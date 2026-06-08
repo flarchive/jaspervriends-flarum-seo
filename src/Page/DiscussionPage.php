@@ -1,0 +1,336 @@
+<?php
+
+/*
+ * This file is part of fof/seo.
+ *
+ * Copyright (c) FriendsOfFlarum.
+ *
+ * For the full copyright and license information, please view the LICENSE.md
+ * file that was distributed with this source code.
+ */
+
+namespace FoF\Seo\Page;
+
+use Flarum\Database\Eloquent\Collection;
+use Flarum\Discussion\DiscussionRepository;
+use Flarum\Extension\ExtensionManager;
+use Flarum\Foundation\DispatchEventsTrait;
+use Flarum\Http\SlugManager;
+use Flarum\Http\UrlGenerator;
+use Flarum\Post\CommentPost;
+use Flarum\Post\Post;
+use Flarum\Settings\SettingsRepositoryInterface;
+use Flarum\Tags\Tag;
+use Flarum\User\User;
+use Flarum\User\UserRepository;
+use FoF\Seo\SeoMeta\SeoMeta;
+use FoF\Seo\SeoProperties;
+use FoF\Seo\TagIndexingPolicy;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Support\Arr;
+use Psr\Http\Message\ServerRequestInterface;
+use Symfony\Contracts\Translation\TranslatorInterface;
+
+class DiscussionPage implements PageDriverInterface
+{
+    use DispatchEventsTrait;
+
+    protected Dispatcher $events;
+
+    public function __construct(
+        protected readonly SettingsRepositoryInterface $settingsRepositoryInterface,
+        protected readonly DiscussionRepository $discussionRepository,
+        protected readonly UserRepository $userRepository,
+        protected readonly ExtensionManager $extensionManager,
+        protected readonly UrlGenerator $urlGenerator,
+        Dispatcher $events,
+        protected readonly SlugManager $slugManager,
+        protected readonly TagIndexingPolicy $tagIndexingPolicy,
+        protected readonly TranslatorInterface $translator,
+    ) {
+        $this->events = $events;
+    }
+
+    /**
+     * Build a schema.org Person for a post/discussion author. `author` is a
+     * required field on DiscussionForumPosting and on each Comment (GH #140),
+     * so a deleted user falls back to the localized "[deleted]" display name
+     * with no profile url rather than being omitted.
+     *
+     * @return array<string, string>
+     */
+    private function authorSchema(?User $user): array
+    {
+        if ($user === null) {
+            return [
+                '@type' => 'Person',
+                'name'  => $this->translator->trans('core.lib.username.deleted_text'),
+            ];
+        }
+
+        return [
+            '@type' => 'Person',
+            'name'  => $user->getDisplayNameAttribute(),
+            'url'   => $this->urlGenerator->to('forum')->route('user', ['username' => $this->slugManager->forResource(User::class)->toSlug($user)]),
+        ];
+    }
+
+    public function extensionDependencies(): array
+    {
+        return [];
+    }
+
+    public function handleRoutes(): array
+    {
+        return ['discussion'];
+    }
+
+    public function handle(
+        ServerRequestInterface $request,
+        SeoProperties $properties
+    ): void {
+        // Get discussion ID from params. The route param is the `{id}-{slug}`
+        // form (e.g. "1-bake-bread"); cast to int to extract the numeric id so
+        // the lookup works regardless of database (SQLite won't coerce it).
+        $discussionId = (int) Arr::get($request->getQueryParams(), 'id');
+
+        try {
+            // Find discussion
+            $discussion = $this->discussionRepository->findOrFail($discussionId);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            // Do nothing, no model found
+            return;
+        }
+
+        $tagsEnabled = $this->extensionManager->isEnabled('flarum-tags');
+        $enableBestAnswer = $this->extensionManager->isEnabled('fof-best-answer');
+        $enableLikes = $this->extensionManager->isEnabled('flarum-likes');
+        $enableGamification = $this->extensionManager->isEnabled('fof-gamification');
+
+        /** @var Collection<int, Tag> $discussionTags */
+        $discussionTags = $discussion->tags;
+
+        // Defer to DiscussionBestAnswerPage when it will actually emit a QAPage
+        // for this discussion: best-answer installed, this is a Q&A discussion,
+        // and either the post crawler is on (full QAPage) or an accepted answer
+        // exists (lightweight QAPage with just that answer). In every other case
+        // (no best-answer, non-Q&A, crawler off without an accepted answer) we
+        // emit the standard DiscussionForumPosting here.
+        $isQna = $tagsEnabled && $enableBestAnswer && $discussionTags->contains(fn (Tag $tag) => (bool) $tag->is_qna || (bool) $tag->parent?->is_qna);
+
+        if ($isQna) {
+            $crawlerEnabled = $this->settingsRepositoryInterface->get('seo_post_crawler', 0) == 1;
+
+            if ($crawlerEnabled || $discussion->best_answer_post_id !== null) {
+                return;
+            }
+        }
+
+        // Get seo-meta-date
+        $seoMeta = SeoMeta::findByModelOrCreate(
+            $discussion
+        );
+
+        // Run events in case the model was created
+        $this->dispatchEventsFor($seoMeta);
+
+        // Update ld-json
+        $properties
+            ->setSchemaJson('@type', 'DiscussionForumPosting')
+
+            // Set page type article
+            ->setMetaPropertyTag('og:type', 'article');
+
+        // Generate data
+        $properties->generateTagsFromMetaData($seoMeta);
+
+        // Update topic url
+        $properties->setUrl($this->urlGenerator->to('forum')->route('discussion', ['id' => $discussion->id.'-'.$discussion->slug]), false);
+
+        // Optional fof/discussion-language integration: a discussion's own
+        // language drives inLanguage, overriding the viewer's locale.
+        if ($this->extensionManager->isEnabled('fof-discussion-language')) {
+            $languageCode = data_get($discussion->getAttribute('language'), 'code');
+
+            if ($languageCode !== null) {
+                $properties->setSchemaJson('inLanguage', $languageCode);
+            }
+        }
+
+        // Schema.org DiscussionForumPosting enrichment (Google forum guidelines).
+        $properties->setSchemaJson('headline', $seoMeta->title ?? $discussion->title);
+
+        // `datePublished` is a required property for DiscussionForumPosting.
+        if ($discussion->created_at !== null) {
+            $properties->setSchemaJson('datePublished', $discussion->created_at->toIso8601String());
+        }
+
+        // Surface the last activity as `dateModified` (recommended).
+        if ($discussion->last_posted_at !== null) {
+            $properties->setSchemaJson('dateModified', $discussion->last_posted_at->toIso8601String());
+        }
+
+        $replyCount = max(0, $discussion->comment_count - 1);
+        $properties->setSchemaJson('commentCount', $replyCount);
+
+        $interactionStatistic = [
+            [
+                '@type'                => 'InteractionCounter',
+                'interactionType'      => 'https://schema.org/CommentAction',
+                'userInteractionCount' => $replyCount,
+            ],
+        ];
+
+        // Optional fof/discussion-views integration: expose the view count.
+        if ($this->extensionManager->isEnabled('fof-discussion-views')) {
+            $interactionStatistic[] = [
+                '@type'                => 'InteractionCounter',
+                'interactionType'      => 'https://schema.org/ViewAction',
+                'userInteractionCount' => (int) $discussion->getAttribute('view_count'),
+            ];
+        }
+
+        $firstPost = $discussion->firstPost;
+
+        if ($firstPost instanceof CommentPost) {
+            // Full post text for the `text` property. Render to HTML first so
+            // render-time transforms (mentions -> display names, links) resolve,
+            // then decode entities and strip tags for clean plain text.
+            $text = trim(html_entity_decode(strip_tags($firstPost->formatContent()), ENT_QUOTES | ENT_HTML5));
+
+            if ($text !== '') {
+                $properties->setSchemaJson('text', $text);
+            }
+
+            // Like/upvote count as a LikeAction interaction. Combines flarum/likes
+            // and fof/gamification upvotes when either (or both) is enabled.
+            if ($enableLikes || $enableGamification) {
+                $interactionStatistic[] = [
+                    '@type'                => 'InteractionCounter',
+                    'interactionType'      => 'https://schema.org/LikeAction',
+                    'userInteractionCount' => $this->approvalCount($firstPost, $enableLikes, $enableGamification),
+                ];
+            }
+        }
+
+        $properties->setSchemaJson('interactionStatistic', $interactionStatistic);
+
+        // Expose replies as schema.org Comment nodes (each with its like/upvote
+        // count) when post crawling is enabled. This restores the per-reply
+        // approval signal search engines use to surface standout replies (GH #130),
+        // using the standards-compliant DiscussionForumPosting > comment structure.
+        if ($this->settingsRepositoryInterface->get('seo_post_crawler', 0) == 1) {
+            $countRelations = [];
+
+            if ($enableLikes) {
+                $countRelations[] = 'likes';
+            }
+
+            if ($enableGamification) {
+                $countRelations[] = 'upvotes';
+            }
+
+            // Cap the number of replies rendered into the comment[] block.
+            // Rendering each reply (formatContent) is the dominant page-load
+            // cost, so bound it; a value <= 0 disables the cap entirely.
+            $limit = (int) $this->settingsRepositoryInterface->get('seo_post_crawler_limit', 100);
+
+            $query = $discussion->posts()
+                ->where('number', '>', 1)
+                ->where('type', 'comment')
+                ->where('is_private', false)
+                ->with('user')
+                ->withCount($countRelations)
+                ->orderBy('number');
+
+            if ($limit > 0) {
+                $query->limit($limit);
+            }
+
+            /** @var Collection<int, Post> $replies */
+            $replies = $query->get();
+
+            $comments = $replies->filter(fn (Post $post) => $post instanceof CommentPost)->map(function (CommentPost $post) use ($discussion, $enableLikes, $enableGamification) {
+                $comment = [
+                    '@type'         => 'Comment',
+                    // Render to HTML so mentions/links resolve, then decode
+                    // entities and strip tags for clean plain text.
+                    'text'          => trim(html_entity_decode(strip_tags($post->formatContent()), ENT_QUOTES | ENT_HTML5)),
+                    // Google requires `datePublished` on Comment nodes; keep
+                    // `dateCreated` too for schema.org completeness.
+                    'datePublished' => $post->created_at->toIso8601String(),
+                    'dateCreated'   => $post->created_at->toIso8601String(),
+                    'url'           => $this->urlGenerator->to('forum')->route('discussion', ['id' => $discussion->id.'-'.$discussion->slug, 'near' => $post->number]),
+                ];
+
+                // `author` is required on a Comment; deleted users fall back to
+                // a "[deleted]" Person rather than being omitted (GH #140).
+                $comment['author'] = $this->authorSchema($post->user);
+
+                if ($enableLikes || $enableGamification) {
+                    $count = 0;
+
+                    if ($enableLikes) {
+                        $count += (int) $post->getAttribute('likes_count');
+                    }
+
+                    if ($enableGamification) {
+                        $count += (int) $post->getAttribute('upvotes_count');
+                    }
+
+                    $comment['interactionStatistic'] = [
+                        '@type'                => 'InteractionCounter',
+                        'interactionType'      => 'https://schema.org/LikeAction',
+                        'userInteractionCount' => $count,
+                    ];
+                }
+
+                return $comment;
+            })->values()->toArray();
+
+            if (count($comments) > 0) {
+                $properties->setSchemaJson('comment', $comments);
+            }
+        }
+
+        // author: https://schema.org/author typeof: https://schema.org/Person.
+        // Required field, so a deleted author falls back to "[deleted]" (#140).
+        $properties->setSchemaJson('author', $this->authorSchema($discussion->user));
+
+        // Generate a breadcrum if discussion has tags
+        if ($tagsEnabled && $discussionTags->count() >= 1) {
+            $properties->generateSchemaBreadcrumb(
+                $discussionTags->map(fn (Tag $tag) => [
+                    'name' => $tag->name,
+                    'url'  => $this->urlGenerator->to('forum')->route('tag', ['slug' => $tag->slug]),
+                ])->toArray()
+            );
+        }
+
+        // Keep discussions in admin-excluded tags out of the index (GH #117).
+        // Overrides the robots directive set by generateTagsFromMetaData above.
+        if ($tagsEnabled && $this->tagIndexingPolicy->shouldNoindex($discussionTags)) {
+            $properties->setMetaTag('robots', 'noindex, follow');
+        }
+    }
+
+    /**
+     * Total community approval for a single post: flarum/likes likes plus
+     * fof/gamification upvotes (downvotes excluded), for whichever is enabled.
+     */
+    private function approvalCount(Post $post, bool $enableLikes, bool $enableGamification): int
+    {
+        $count = 0;
+
+        if ($enableLikes) {
+            $count += $post->likes()->count();
+        }
+
+        if ($enableGamification) {
+            // Positive gamification votes only (mirrors its `upvotes` relation).
+            $count += $post->votes()->where('value', '>', 0)->count();
+        }
+
+        return $count;
+    }
+}
