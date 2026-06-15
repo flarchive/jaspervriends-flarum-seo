@@ -1,0 +1,92 @@
+<?php
+
+/*
+ * This file is part of fof/seo.
+ *
+ * Copyright (c) FriendsOfFlarum.
+ *
+ * For the full copyright and license information, please view the LICENSE.md
+ * file that was distributed with this source code.
+ */
+
+namespace FoF\Seo\Page;
+
+use Carbon\Carbon;
+use FoF\Pages\PageRepository;
+use FoF\Seo\Breadcrumb\Crumb;
+use FoF\Seo\SeoMeta\SeoMeta;
+use FoF\Seo\SeoProperties;
+use Illuminate\Support\Arr;
+use Psr\Http\Message\ServerRequestInterface;
+use Symfony\Contracts\Translation\TranslatorInterface;
+
+class PageExtensionPage implements PageDriverInterface
+{
+    public function __construct(
+        protected readonly TranslatorInterface $translator,
+        protected readonly PageRepository $pageRepository,
+    ) {
+    }
+
+    public function extensionDependencies(): array
+    {
+        return ['fof-pages'];
+    }
+
+    public function handleRoutes(): array
+    {
+        return ['pages.home', 'pages.page'];
+    }
+
+    public function handle(
+        ServerRequestInterface $request,
+        SeoProperties $properties
+    ): void {
+        // The route param is the `{id}-{slug}` form (e.g. "1-about-us"). Extract
+        // the numeric id so the lookup works on all databases (SQLite won't coerce
+        // "1-about-us" to 1), falling back to the raw value so bare-slug URLs still
+        // resolve via the repository's slug match.
+        $rawId = Arr::get($request->getQueryParams(), 'id');
+        $pageId = (int) $rawId ?: $rawId;
+
+        try {
+            $page = $this->pageRepository->findOrFail($pageId);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            // Do nothing, no model found
+            return;
+        }
+
+        $content = $page->is_html ? $page->content : $page->contentHtml;
+
+        $seoMeta = SeoMeta::findByModelOrCreate(
+            $page,
+            // Meta didn't exist yet, create one
+            function (SeoMeta $meta) use ($page, $properties, $content) {
+                $meta->title = $page->title;
+
+                $meta->created_at = $page->created_at ?? Carbon::now();
+
+                $meta->updated_at = $page->updated_at;
+
+                // Get Tag description
+                $meta->description = $properties->generateDescriptionFromContent(e(strip_tags($content)));
+            }
+        );
+
+        $properties
+            // Add Schema.org metadata: WebPage https://schema.org/WebPage
+            ->setSchemaJson('@type', 'WebPage')
+            ->setSchemaJson('text', e(strip_tags($content)))
+
+            // Tag URL
+            ->setUrl('/p/'.$page->getAttribute('id').'-'.$page->getAttribute('slug'))
+
+            // Canonical url
+            ->setCanonicalUrl('/p/'.$page->getAttribute('id'))
+
+            ->generateTagsFromMetaData($seoMeta);
+
+        // Breadcrumb: Home › {page title}. The page is the current page.
+        $properties->breadcrumb()->push(new Crumb($page->title));
+    }
+}
