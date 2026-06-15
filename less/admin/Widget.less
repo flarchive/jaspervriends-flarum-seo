@@ -1,0 +1,56 @@
+
+.Widget {
+    &.SeoWidget {
+        background: #0072ff;
+        color: #FFFFFF;
+        box-shadow: 0px 1px 3px rgba(0, 0, 0, 0.4);
+        display: none;
+
+        &.needs-review {
+            display: block;
+        }
+
+        .seo-check-icon {
+            font-size: 30px;
+            vertical-align: middle;
+            margin-right: 15px;
+        }
+
+        // The CTA's `className` prop *replaces* the element class, so an empty
+        // string left the anchor with no `Button`/`LinkButton` hook and the
+        // styling never matched — the CTA stayed invisible on the widget's blue
+        // background (GH #159). The component now sets `Button SeoWidget-cta`;
+        // target that explicit class so the white pill always applies.
+        .SeoWidget-cta {
+            background: #FFFFFF;
+            border: 0;
+            text-decoration: none;
+            -webkit-border-radius: 3px;
+            -moz-border-radius: 3px;
+            border-radius: 3px;
+            padding: 10px 20px;
+            margin-left: 15px;
+            color: #0072ff;
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 11px;
+            -webkit-transition: all 250ms ease-in-out;
+            -moz-transition: all 250ms ease-in-out;
+            -ms-transition: all 250ms ease-in-out;
+            -o-transition: all 250ms ease-in-out;
+            transition: all 250ms ease-in-out;
+
+            &,
+            .Button-label {
+                color: #0072ff;
+            }
+
+            &:hover,
+            &:focus {
+                color: #0072ff;
+                text-decoration: none;
+                transform: scale(1.1);
+            }
+        }
+    }
+}
